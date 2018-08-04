@@ -1,0 +1,7 @@
+---
+title: "Tests for speeding up the simplerspec processing workflow using futures"
+author: "Philipp Baumann || philipp.baumann@usys.ethz.ch"
+output: github_document
+---
+
+
