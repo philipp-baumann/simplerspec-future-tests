@@ -201,6 +201,8 @@ system.time(
 )
 t_end <- Sys.time()
 t_end - t_start
+
+spc_proc
 ```
 
 ## Scenario 2: Partition and parallelize with foreach
