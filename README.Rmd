@@ -4,4 +4,235 @@ author: "Philipp Baumann || philipp.baumann@usys.ethz.ch"
 output: github_document
 ---
 
+# Load R packages
+
+```{r, message=FALSE, results=FALSE}
+pkgs <- c("tidyverse", "simplerspec", "future", "future.apply", "doFuture")
+lapply(pkgs, library, character.only = TRUE)
+```
+
+# Plan the future
+
+```{r}
+## Define how `future()s` are resolved
+# doFuture: A Universal Foreach Parallel Adaptor using the Future API of the 'future' Package
+library("doFuture")
+registerDoFuture()
+plan(multicore)
+availableCores()
+```
+
+# Performance test: Reading and processing spectral data
+
+```{r, cache=FALSE, message=FALSE}
+################################################################################
+## Part 1: Read and pre-process spectra
+################################################################################
+
+## Read spectra in list ========================================================
+
+# List of OPUS binary spectra files
+lf <- dir("data/spectra", full.names = TRUE)
+
+# Read spectra from files into R list: sequential ------------------------------
+
+t_start <- Sys.time()
+system.time(
+  spc_list <- read_opus_univ(fnames = lf, extract = c("spc"))
+)
+t_end <- Sys.time()
+t_end - t_start
+
+## Parallel implementation using doFuture --------------------------------------
+
+t_start <- Sys.time()
+system.time(
+  spc_list <- read_opus_univ(fnames = lf, extract = c("spc"), parallel = TRUE)
+)
+t_end <- Sys.time()
+t_end - t_start
+
+## Parallel implementation using doParallel ------------------------------------
+
+# Allows to tune the models using parallel processing (e.g. use all available
+# cores of a CPU); caret package automatically detects the registered backend
+library("doParallel")
+# Make a cluster with all possible threads (more than physical cores)
+cl <- makeCluster(detectCores())
+# Register backend
+registerDoParallel(cl)
+# Return number of parallel workers
+getDoParWorkers() # 8 threads on MacBook Pro (Retina, 15-inch, Mid 2015);
+# Quadcore processor
+
+t_start <- Sys.time()
+system.time(
+  spc_list <- read_opus_univ(fnames = lf, extract = c("spc"), parallel = TRUE)
+)
+t_end <- Sys.time()
+t_end - t_start
+```
+
+# Gather spectral data from list into tibble
+
+```{r}
+# Gather spectra from nested list into tibble
+t_start <- Sys.time()
+system.time(
+  spc_gathered <- gather_spc(spc_list)
+)
+t_end <- Sys.time()
+
+spc_gathered
+```
+
+
+## Scenario 0: Use sequential processing (single-threaded R process)
+
+
+```{r}
+t_start <- Sys.time()
+system.time(
+  spc_proc <- spc_gathered %>%
+    # Resample spectra to new wavenumber interval
+    resample_spc(wn_lower = 500, wn_upper = 3996, wn_interval = 2) %>%
+    # Average replicate scans per sample_id
+    average_spc() %>%
+    # Preprocess spectra using Savitzky-Golay first derivative with
+    # a window size of 21 points
+    preprocess_spc(select = "sg_1_w21")
+)
+t_end <- Sys.time()
+t_end - t_start
+```
+
+## Scenario 1: Chunk tibble into partitions and process partitions in parallel
+
+```{r}
+# Inspired from multidplyr::partition();
+# see https://github.com/hadley/multidplyr/blob/master/R/shard.R
+partition_spc <- function(spc_tbl, 
+                          groups = future::availableCores(),
+                          id_nopart = sample_id) {
+  id_nopart <- enquo(id_nopart)
+  spc_tbl_nested <- spc_tbl %>%
+    dplyr::group_by(!!id_nopart) %>%
+    tidyr::nest()
+  n <- nrow(spc_tbl_nested)
+  m <- groups
+  part_id <- sample(floor(m * (seq_len(n) - 1L) / n + 1L))
+  
+  spc_tbl_nested %>%
+    dplyr::mutate(part_id = as.integer(part_id)) %>%
+    tidyr::unnest()
+}
+
+spc_gathered %>%
+    partition_spc()
+```
+
+### Scenario 1 variant a: use `furrr::future_map()`
+
+```{r}
+system.time(
+spc_proc <- spc_gathered %>%
+    partition_spc() %>%
+    split(f = .$part_id) %>%
+    furrr::future_map(
+      ~ .x %>%
+          # Resample spectra to new wavenumber interval
+          resample_spc(wn_lower = 500, wn_upper = 3996, wn_interval = 2) %>%
+          # Average replicate scans per sample_id
+          average_spc() %>%
+          # Preprocess spectra using Savitzky-Golay first derivative with
+          # a window size of 21 points
+          preprocess_spc(select = "sg_1_w21")
+    )
+)
+
+spc_proc
+```
+
+### Scenario 1 variant b: use `future.apply::future_lapply()`
+
+```{r}
+t_start <- Sys.time()
+system.time(
+spc_proc <- spc_gathered %>%
+    partition_spc() %>%
+    split(f = .$part_id) %>%
+    future.apply::future_lapply(
+      function(x) x %>%
+          # Resample spectra to new wavenumber interval
+          resample_spc(wn_lower = 500, wn_upper = 3996, wn_interval = 2) %>%
+          # Average replicate scans per sample_id
+          average_spc() %>%
+          # Preprocess spectra using Savitzky-Golay first derivative with
+          # a window size of 21 points
+          preprocess_spc(select = "sg_1_w21")
+    )
+)
+t_end <- Sys.time()
+t_end - t_start
+```
+
+
+## All in once: Partition, process in parallel, and row bind/gather results into tibble 
+
+```{r}
+plan(multiprocess)
+
+t_start <- Sys.time()
+system.time(
+  spc_proc <- spc_gathered %>%
+    partition_spc() %>%
+    split(f = .$part_id) %>%
+    furrr::future_map(
+      ~ .x %>%
+      # Resample spectra to new wavenumber interval
+      resample_spc(wn_lower = 500, wn_upper = 3996, wn_interval = 2) %>%
+      # Average replicate scans per sample_id
+      average_spc() %>%
+      # Preprocess spectra using Savitzky-Golay first derivative with
+      # a window size of 21 points
+      preprocess_spc(select = "sg_1_w21")
+      ) %>%
+      dplyr::bind_rows()
+)
+t_end <- Sys.time()
+t_end - t_start
+```
+
+## Scenario 2: Partition and parallelize with foreach
+
+```{r}
+t_start <- Sys.time()
+spc_proc_l <- spc_gathered %>%
+  partition_spc() %>%
+  split(f = .$part_id)
+
+  spc_proc <- foreach::foreach(i = seq_along(spc_proc_l),
+    # .export = "read_opus_bin_univ",
+    .errorhandling = "pass", # error object generated by task evaluation will
+    # be included with the rest of the results
+    # export the foreach package to the individual workers
+    .packages = c("foreach", "simplerspec", "magrittr")) %dopar% {
+      # Resample spectra to new wavenumber interval
+      spc_proc_l[[i]] %>%
+        resample_spc(wn_lower = 500, wn_upper = 3996, wn_interval = 2) %>%
+        # Average replicate scans per sample_id
+        average_spc() %>%
+        # Preprocess spectra using Savitzky-Golay first derivative with
+        # a window size of 21 points
+        preprocess_spc(select = "sg_1_w21")
+    }
+t_end <- Sys.time()
+t_end - t_start
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
 
